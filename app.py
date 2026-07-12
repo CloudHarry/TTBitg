@@ -66,6 +66,7 @@ THRESHOLD_MIN = float(os.getenv("THRESHOLD_MIN", "70"))
 WIN_PROB_MIN = float(os.getenv("WIN_PROB_MIN", "80"))
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 INTERVAL_MINUTES = int(os.getenv("INTERVAL_MINUTES", "15"))
+POSITION_CHECK_SECONDS = int(os.getenv("POSITION_CHECK_SECONDS", "15"))
 MAX_HOLD_MINUTES = int(os.getenv("MAX_HOLD_MINUTES", "240"))
 DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT_USDT", "-20"))
 
@@ -124,95 +125,111 @@ _last_command = ""
 # ----------------------------------------------------------------------
 # JOB UTAMA (dipanggil otomatis tiap INTERVAL_MINUTES, atau manual via 'scan')
 # ----------------------------------------------------------------------
-def job(manual=False):
+def check_entry(manual=False):
+    """Scan koin & entry kalau belum ada posisi. Dipanggil tiap INTERVAL_MINUTES (berat, scan banyak koin)."""
     global active_position, current_symbol
+
+    if active_position:
+        return  # sudah ada posisi, tidak perlu scan lagi
 
     if not state.running and not manual:
         return
 
     allowed, reason = tripwire.can_trade()
-    if not allowed and not active_position:
+    if not allowed:
         state.log.add(f"TripWire mengunci entry baru: {reason}", "WARNING")
         return
 
-    if not active_position:
-        state.log.add("Scanning simbol...", "INFO")
-        try:
-            result = bot.scan_and_filter(threshold_min=state.threshold_min, win_prob_min=state.win_prob_min)
-            tripwire.record_api_call(True)
-        except Exception as e:
-            tripwire.record_api_call(False)
-            state.log.add(f"Scan gagal: {e}", "ERROR")
-            result = None
+    state.log.add("Scanning simbol...", "INFO")
+    try:
+        result = bot.scan_and_filter(threshold_min=state.threshold_min, win_prob_min=state.win_prob_min)
+        tripwire.record_api_call(True)
+    except Exception as e:
+        tripwire.record_api_call(False)
+        state.log.add(f"Scan gagal: {e}", "ERROR")
+        result = None
 
+    with state.lock:
+        state.scan_results = bot.last_scan_results
+        state.last_scan_at = datetime.now()
+
+    if result is None:
+        state.log.add("Tidak ada koin lolos filter.", "INFO")
+        return
+
+    symbol, threshold, win_probability = result
+    state.log.add(f"Kandidat: {symbol} thr={threshold}% wp={win_probability}%", "INFO")
+
+    order = bot.entry_order(symbol, usdt_amount=USDT_AMOUNT, leverage=LEVERAGE)
+    if order:
+        active_position = True
+        current_symbol = symbol
+        tripwire.record_trade_open()
         with state.lock:
-            state.scan_results = bot.last_scan_results
-            state.last_scan_at = datetime.now()
-
-        if result is None:
-            state.log.add("Tidak ada koin lolos filter.", "INFO")
-            return
-
-        symbol, threshold, win_probability = result
-        state.log.add(f"Kandidat: {symbol} thr={threshold}% wp={win_probability}%", "INFO")
-
-        order = bot.entry_order(symbol, usdt_amount=USDT_AMOUNT, leverage=LEVERAGE)
-        if order:
-            active_position = True
-            current_symbol = symbol
-            tripwire.record_trade_open()
-            with state.lock:
-                state.has_position = True
-                state.symbol = symbol
-                state.side = "long"
-                state.leverage = LEVERAGE
-                state.entry_price = order.get("price") or order.get("average")
-                state.stop_loss = round(state.entry_price * (1 - TRAILING_PERCENT / 100), 6) if state.entry_price else None
-                state.take_profit = round(state.entry_price * (1 + TP_PERCENT / 100), 6) if state.entry_price else None
-                state.size = order.get("size") or order.get("amount")
-                state.position_opened_at = datetime.now()
-            state.log.add(f"Entry berhasil: {symbol}", "SUCCESS")
-        else:
-            state.log.add(f"Entry gagal untuk {symbol}", "ERROR")
-
+            state.has_position = True
+            state.symbol = symbol
+            state.side = "long"
+            state.leverage = LEVERAGE
+            state.entry_price = order.get("price") or order.get("average")
+            state.stop_loss = round(state.entry_price * (1 - TRAILING_PERCENT / 100), 6) if state.entry_price else None
+            state.take_profit = round(state.entry_price * (1 + TP_PERCENT / 100), 6) if state.entry_price else None
+            state.size = order.get("size") or order.get("amount")
+            state.position_opened_at = datetime.now()
+        state.log.add(f"Entry berhasil: {symbol}", "SUCCESS")
     else:
-        try:
-            closed = monitor.trail_stop(current_symbol, trailing_percent=TRAILING_PERCENT, take_profit=state.take_profit)
-            tripwire.record_api_call(True)
-        except Exception as e:
-            tripwire.record_api_call(False)
-            state.log.add(f"Trail stop error: {e}", "ERROR")
-            closed = False
+        state.log.add(f"Entry gagal untuk {symbol}", "ERROR")
 
-        # update harga & uPnL terkini untuk tampilan, terlepas closed atau tidak
-        try:
-            ticker = client.fetch_ticker(current_symbol)
-            price = ticker.get("last") or ticker.get("close")
-            with state.lock:
-                state.current_price = price
-                if state.entry_price and state.size:
-                    state.upnl = round((price - state.entry_price) * state.size, 4)
-                sym_state = monitor.trailing_data.get(current_symbol)
-                if sym_state:
-                    state.stop_loss = round(sym_state["highest_price"] * (1 - TRAILING_PERCENT / 100), 6)
-        except Exception:
-            pass
 
-        if closed:
-            reason_label = "take profit" if closed == "TAKE_PROFIT" else "trailing stop"
-            state.log.add(f"Posisi {current_symbol} ditutup oleh {reason_label}.", "SUCCESS")
-            tripwire.record_trade_close(state.upnl or 0)
-            active_position = False
-            current_symbol = None
-            with state.lock:
-                state.has_position = False
-                state.symbol = "-"
-                state.upnl = 0.0
-                state.position_opened_at = None
-                state.take_profit = None
-                state.stop_loss = None
-        else:
-            state.log.add(f"Posisi {current_symbol} masih berjalan.", "INFO")
+def check_position():
+    """Cek trailing stop, take profit, update harga & uPnL. Dipanggil sering (ringan, cuma 1 ticker)."""
+    global active_position, current_symbol
+
+    if not active_position or not current_symbol:
+        return
+
+    try:
+        closed = monitor.trail_stop(current_symbol, trailing_percent=TRAILING_PERCENT, take_profit=state.take_profit)
+        tripwire.record_api_call(True)
+    except Exception as e:
+        tripwire.record_api_call(False)
+        state.log.add(f"Trail stop error: {e}", "ERROR")
+        closed = False
+
+    # update harga & uPnL terkini untuk tampilan, terlepas closed atau tidak
+    try:
+        ticker = client.fetch_ticker(current_symbol)
+        price = ticker.get("last") or ticker.get("close")
+        with state.lock:
+            state.current_price = price
+            if state.entry_price and state.size:
+                state.upnl = round((price - state.entry_price) * state.size, 4)
+            sym_state = monitor.trailing_data.get(current_symbol)
+            if sym_state:
+                state.stop_loss = round(sym_state["highest_price"] * (1 - TRAILING_PERCENT / 100), 6)
+    except Exception:
+        pass
+
+    if closed:
+        reason_label = "take profit" if closed == "TAKE_PROFIT" else "trailing stop"
+        state.log.add(f"Posisi {current_symbol} ditutup oleh {reason_label}.", "SUCCESS")
+        tripwire.record_trade_close(state.upnl or 0)
+        active_position = False
+        current_symbol = None
+        with state.lock:
+            state.has_position = False
+            state.symbol = "-"
+            state.upnl = 0.0
+            state.position_opened_at = None
+            state.take_profit = None
+            state.stop_loss = None
+
+
+def job(manual=False):
+    """Backward-compat wrapper: jalankan cek posisi (kalau ada) atau entry (kalau tidak ada)."""
+    if active_position:
+        check_position()
+    else:
+        check_entry(manual=manual)
 
 
 def refresh_balance():
@@ -278,14 +295,22 @@ def manual_analyze(symbol):
 # ----------------------------------------------------------------------
 # THREAD: JOB SCHEDULER (interval otomatis)
 # ----------------------------------------------------------------------
-def job_scheduler_loop():
-    job(manual=True)  # panggil sekali di awal
+def entry_scan_loop():
+    """Loop scan koin baru & entry -- tiap INTERVAL_MINUTES, cuma jalan kalau belum ada posisi."""
+    check_entry(manual=True)  # panggil sekali di awal
     last_run = time.time()
     while not _stop_event.is_set():
         if time.time() - last_run >= INTERVAL_MINUTES * 60:
-            job()
+            check_entry()
             last_run = time.time()
         time.sleep(1)
+
+
+def position_monitor_loop():
+    """Loop cek posisi aktif (trailing stop, TP, update harga) -- tiap POSITION_CHECK_SECONDS, jauh lebih sering dari entry scan."""
+    while not _stop_event.is_set():
+        check_position()
+        time.sleep(POSITION_CHECK_SECONDS)
 
 
 # ----------------------------------------------------------------------
@@ -320,7 +345,7 @@ def command_loop(live: Live):
             state.log.add("Job otomatis dijeda (posisi aktif tetap dipantau).", "WARNING")
         elif action == "scan":
             state.log.add("Scan manual dipicu...", "INFO")
-            threading.Thread(target=job, kwargs={"manual": True}, daemon=True).start()
+            threading.Thread(target=check_entry, kwargs={"manual": True}, daemon=True).start()
         elif action == "analyze":
             threading.Thread(target=manual_analyze, args=(arg,), daemon=True).start()
         elif action == "reset":
@@ -349,10 +374,12 @@ def render_loop(live: Live):
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
     with Live(console=console, screen=True, refresh_per_second=1) as live:
-        t_job = threading.Thread(target=job_scheduler_loop, daemon=True)
+        t_entry = threading.Thread(target=entry_scan_loop, daemon=True)
+        t_position = threading.Thread(target=position_monitor_loop, daemon=True)
         t_render = threading.Thread(target=render_loop, args=(live,), daemon=True)
         t_balance = threading.Thread(target=balance_loop, daemon=True)
-        t_job.start()
+        t_entry.start()
+        t_position.start()
         t_render.start()
         t_balance.start()
 
