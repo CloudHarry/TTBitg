@@ -37,6 +37,7 @@ from rich.live import Live
 from trading_bot import TradingBot
 from monitor import Monitor
 from risk_manager import TripWire
+from trade_journal import TradeJournal
 from dashboard import BotState, render_dashboard
 
 # ----------------------------------------------------------------------
@@ -69,6 +70,7 @@ INTERVAL_MINUTES = int(os.getenv("INTERVAL_MINUTES", "15"))
 POSITION_CHECK_SECONDS = int(os.getenv("POSITION_CHECK_SECONDS", "15"))
 MAX_HOLD_MINUTES = int(os.getenv("MAX_HOLD_MINUTES", "240"))
 DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT_USDT", "-20"))
+JOURNAL_PATH = os.getenv("JOURNAL_PATH", "trades_journal.csv")
 
 if not API_KEY or not API_SECRET or not API_PASSWORD:
     console.print("[bold red]BITGET_API_KEY / BITGET_API_SECRET / BITGET_API_PASSWORD belum diset di .env[/bold red]")
@@ -100,6 +102,8 @@ except Exception as e:
 bot = TradingBot(client, symbol_list=None, timeframe=TIMEFRAME, limit=LIMIT, dry_run=DRY_RUN)
 monitor = Monitor(client)
 tripwire = TripWire(daily_loss_limit_usdt=DAILY_LOSS_LIMIT)
+journal = TradeJournal(filepath=JOURNAL_PATH)
+state.log.add(f"Trade journal aktif: {JOURNAL_PATH}", "INFO")
 
 active_position = False
 current_symbol = None
@@ -176,6 +180,18 @@ def check_entry(manual=False):
             state.size = order.get("size") or order.get("amount")
             state.position_opened_at = datetime.now()
         state.log.add(f"Entry berhasil: {symbol}", "SUCCESS")
+        journal.log_entry(
+            mode=state.mode,
+            symbol=symbol,
+            side="long",
+            price=state.entry_price,
+            size=state.size,
+            usdt_amount=USDT_AMOUNT,
+            leverage=LEVERAGE,
+            threshold_pct=threshold,
+            win_probability_pct=win_probability,
+            balance_after=state.balance_usdt,
+        )
     else:
         state.log.add(f"Entry gagal untuk {symbol}", "ERROR")
 
@@ -212,6 +228,16 @@ def check_position():
     if closed:
         reason_label = "take profit" if closed == "TAKE_PROFIT" else "trailing stop"
         state.log.add(f"Posisi {current_symbol} ditutup oleh {reason_label}.", "SUCCESS")
+        journal.log_close(
+            mode=state.mode,
+            symbol=current_symbol,
+            side=state.side,
+            price=state.current_price,
+            size=state.size,
+            close_reason=closed,
+            pnl_usdt=state.upnl,
+            balance_after=state.balance_usdt,
+        )
         tripwire.record_trade_close(state.upnl or 0)
         active_position = False
         current_symbol = None
@@ -267,6 +293,16 @@ def manual_close():
     closed = monitor._close_position(current_symbol)
     if closed:
         state.log.add(f"Posisi {current_symbol} ditutup manual.", "SUCCESS")
+        journal.log_close(
+            mode=state.mode,
+            symbol=current_symbol,
+            side=state.side,
+            price=state.current_price,
+            size=state.size,
+            close_reason="MANUAL",
+            pnl_usdt=state.upnl,
+            balance_after=state.balance_usdt,
+        )
         tripwire.record_trade_close(state.upnl or 0)
         active_position = False
         current_symbol = None
