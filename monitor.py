@@ -34,7 +34,6 @@ class Monitor:
         return open_positions
 
     def trail_stop(self, symbol, trailing_percent=1.5, take_profit=None):
-        """V2: Menerima trailing_percent dinamis hasil perhitungan ATR saat Entry"""
         try:
             ticker = self.client.fetch_ticker(symbol)
             current_price = ticker.get("last") or ticker.get("close")
@@ -51,13 +50,12 @@ class Monitor:
 
         if symbol not in self.trailing_data:
             self.trailing_data[symbol] = {"highest_price": current_price}
-            logger.info(f"[MONITOR V2] Pantau {symbol} dengan Jarak ATR Trail: {trailing_percent}%")
+            logger.info(f"[MONITOR] Mengunci Jarak Trailing Dinamis V2: {trailing_percent}%")
 
         state = self.trailing_data[symbol]
         if current_price > state["highest_price"]:
             state["highest_price"] = current_price
 
-        # Hitung harga batas stop menggunakan persentase dinamis
         stop_price = state["highest_price"] * (1 - trailing_percent / 100)
 
         if current_price <= stop_price:
