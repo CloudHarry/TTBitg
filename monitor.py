@@ -20,8 +20,9 @@ logger = logging.getLogger("Monitor")
 
 
 class Monitor:
-    def __init__(self, client):
+    def __init__(self, client, dry_run=False):
         self.client = client
+        self.dry_run = dry_run
         # state internal: {symbol: {"highest_price": float}}
         self.trailing_data = {}
 
@@ -124,7 +125,11 @@ class Monitor:
 
     # ------------------------------------------------------------------
     def _close_position(self, symbol):
-        """Tutup posisi long dengan market sell reduceOnly."""
+        """Tutup posisi long dengan market sell reduceOnly. Kalau dry_run, cuma simulasi tanpa cek posisi asli di exchange."""
+        if self.dry_run:
+            logger.info(f"[DRY RUN] {symbol}: simulasi close posisi (tidak ada order asli dikirim).")
+            return True
+
         try:
             positions = self.get_open_positions()
             pos = next((p for p in positions if p.get("symbol") == symbol), None)

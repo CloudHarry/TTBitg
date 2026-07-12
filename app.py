@@ -100,7 +100,7 @@ except Exception as e:
     state.log.add(f"Gagal load_markets: {e}", "ERROR")
 
 bot = TradingBot(client, symbol_list=None, timeframe=TIMEFRAME, limit=LIMIT, dry_run=DRY_RUN)
-monitor = Monitor(client)
+monitor = Monitor(client, dry_run=DRY_RUN)
 tripwire = TripWire(daily_loss_limit_usdt=DAILY_LOSS_LIMIT)
 journal = TradeJournal(filepath=JOURNAL_PATH)
 state.log.add(f"Trade journal aktif: {JOURNAL_PATH}", "INFO")
