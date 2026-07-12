@@ -61,6 +61,7 @@ LIMIT = int(os.getenv("LIMIT", "100"))
 USDT_AMOUNT = float(os.getenv("USDT_AMOUNT", "50"))
 LEVERAGE = int(os.getenv("LEVERAGE", "5"))
 TRAILING_PERCENT = float(os.getenv("TRAILING_PERCENT", "1.0"))
+TP_PERCENT = float(os.getenv("TP_PERCENT", "2.0"))
 THRESHOLD_MIN = float(os.getenv("THRESHOLD_MIN", "70"))
 WIN_PROB_MIN = float(os.getenv("WIN_PROB_MIN", "80"))
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
@@ -167,6 +168,7 @@ def job(manual=False):
                 state.leverage = LEVERAGE
                 state.entry_price = order.get("price") or order.get("average")
                 state.stop_loss = round(state.entry_price * (1 - TRAILING_PERCENT / 100), 6) if state.entry_price else None
+                state.take_profit = round(state.entry_price * (1 + TP_PERCENT / 100), 6) if state.entry_price else None
                 state.size = order.get("size") or order.get("amount")
                 state.position_opened_at = datetime.now()
             state.log.add(f"Entry berhasil: {symbol}", "SUCCESS")
@@ -175,7 +177,7 @@ def job(manual=False):
 
     else:
         try:
-            closed = monitor.trail_stop(current_symbol, trailing_percent=TRAILING_PERCENT)
+            closed = monitor.trail_stop(current_symbol, trailing_percent=TRAILING_PERCENT, take_profit=state.take_profit)
             tripwire.record_api_call(True)
         except Exception as e:
             tripwire.record_api_call(False)
@@ -197,7 +199,8 @@ def job(manual=False):
             pass
 
         if closed:
-            state.log.add(f"Posisi {current_symbol} ditutup oleh trailing stop.", "SUCCESS")
+            reason_label = "take profit" if closed == "TAKE_PROFIT" else "trailing stop"
+            state.log.add(f"Posisi {current_symbol} ditutup oleh {reason_label}.", "SUCCESS")
             tripwire.record_trade_close(state.upnl or 0)
             active_position = False
             current_symbol = None
@@ -206,8 +209,36 @@ def job(manual=False):
                 state.symbol = "-"
                 state.upnl = 0.0
                 state.position_opened_at = None
+                state.take_profit = None
+                state.stop_loss = None
         else:
             state.log.add(f"Posisi {current_symbol} masih berjalan.", "INFO")
+
+
+def refresh_balance():
+    """Fetch saldo USDT terkini dari exchange, update state.balance_usdt."""
+    try:
+        balance = client.fetch_balance(params={"type": "swap"})
+        usdt = balance.get("USDT", {}) or balance.get("total", {}).get("USDT")
+        if isinstance(usdt, dict):
+            free = usdt.get("free")
+        else:
+            free = usdt
+        if free is None:
+            free = balance.get("free", {}).get("USDT")
+        with state.lock:
+            state.balance_usdt = float(free) if free is not None else state.balance_usdt
+        tripwire.record_api_call(True)
+    except Exception as e:
+        tripwire.record_api_call(False)
+        state.log.add(f"Gagal ambil saldo: {e}", "WARNING")
+
+
+def balance_loop():
+    """Thread terpisah, refresh saldo tiap 60 detik (tidak perlu nunggu siklus 15 menit)."""
+    while not _stop_event.is_set():
+        refresh_balance()
+        time.sleep(60)
 
 
 def manual_close():
@@ -320,8 +351,10 @@ if __name__ == "__main__":
     with Live(console=console, screen=True, refresh_per_second=1) as live:
         t_job = threading.Thread(target=job_scheduler_loop, daemon=True)
         t_render = threading.Thread(target=render_loop, args=(live,), daemon=True)
+        t_balance = threading.Thread(target=balance_loop, daemon=True)
         t_job.start()
         t_render.start()
+        t_balance.start()
 
         try:
             command_loop(live)

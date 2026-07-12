@@ -58,27 +58,39 @@ class Monitor:
         return open_positions
 
     # ------------------------------------------------------------------
-    def trail_stop(self, symbol, trailing_percent=1.0):
+    def trail_stop(self, symbol, trailing_percent=1.0, take_profit=None):
         """
-        Jalankan trailing stop untuk posisi LONG di `symbol`.
+        Jalankan trailing stop (dan cek take profit opsional) untuk posisi LONG di `symbol`.
 
         Logika:
         1. Ambil harga terakhir.
-        2. Update highest_price kalau harga sekarang bikin rekor baru.
-        3. Hitung stop_price = highest_price * (1 - trailing_percent/100).
-        4. Kalau harga sekarang <= stop_price -> close posisi (market sell, reduceOnly).
+        2. Kalau take_profit diisi dan harga sekarang >= take_profit -> close (TP tersentuh).
+        3. Update highest_price kalau harga sekarang bikin rekor baru.
+        4. Hitung stop_price = highest_price * (1 - trailing_percent/100).
+        5. Kalau harga sekarang <= stop_price -> close posisi (market sell, reduceOnly).
 
-        Return: True kalau posisi ditutup (trailing stop tersentuh), False kalau belum.
+        Return: None kalau posisi belum ditutup, atau string alasan penutupan
+        ("TAKE_PROFIT" / "TRAILING_STOP") kalau ditutup. String truthy jadi
+        tetap kompatibel dengan `if trail_stop(...):` di kode lama.
         """
         try:
             ticker = self.client.fetch_ticker(symbol)
             current_price = ticker.get("last") or ticker.get("close")
             if not current_price:
                 logger.warning(f"Tidak bisa ambil harga terakhir untuk {symbol}, skip trail_stop.")
-                return False
+                return None
         except Exception as e:
             logger.error(f"Gagal fetch_ticker {symbol}: {e}")
-            return False
+            return None
+
+        # cek take profit dulu (kalau diisi)
+        if take_profit is not None and current_price >= take_profit:
+            logger.info(f"{symbol}: harga menyentuh take profit ({current_price} >= {take_profit}). Menutup posisi...")
+            closed = self._close_position(symbol)
+            if closed:
+                self.trailing_data.pop(symbol, None)
+                return "TAKE_PROFIT"
+            return None
 
         # inisialisasi state kalau simbol ini baru dipantau
         if symbol not in self.trailing_data:
@@ -103,11 +115,12 @@ class Monitor:
             closed = self._close_position(symbol)
             if closed:
                 # bersihkan state setelah posisi ditutup
-                del self.trailing_data[symbol]
-                return True
-            return False
 
-        return False
+                del self.trailing_data[symbol]
+                return "TRAILING_STOP"
+            return None
+
+        return None
 
     # ------------------------------------------------------------------
     def _close_position(self, symbol):
